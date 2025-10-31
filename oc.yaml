@@ -1,6 +1,8 @@
 ## PostgreSQL: 1 nodo de escritura (master) + 2 nodos de lectura (replicas)
-# Usa la imagen de Bitnami PostgreSQL que soporta modo master/replica vía variables de entorno.
-# Cambia las contraseñas en el Secret por valores seguros antes de usar en producción.
+# Esta versión usa la imagen oficial `postgres:15` (no Bitnami).
+# - Incluye un Secret con credenciales (reemplaza los valores por contraseñas seguras)
+# - Un ConfigMap con scripts: uno para crear el usuario de replicación en el master
+#   y otro para que las réplicas realicen pg_basebackup desde el master al iniciarse.
 
 apiVersion: v1
 kind: Secret
@@ -8,13 +10,63 @@ metadata:
   name: postgres-credentials
 type: Opaque
 data:
-  # Valores base64: postgres / replicator / rep-pass
-  POSTGRESQL_PASSWORD: cG9zdGdyZXM= # postgres
-  POSTGRESQL_REPLICATION_USER: cmVwbGljYXRvcg== # replicator
-  POSTGRESQL_REPLICATION_PASSWORD: cmVwLXBhc3M= # rep-pass
+  # Base64 values (replace with secure values):
+  # POSTGRES_PASSWORD -> example: 'postgres' -> cG9zdGdyZXM=
+  # REPLICATION_USER -> 'repl' -> cmVwbA==
+  # REPLICATION_PASSWORD -> 'rep-pass' -> cmVwLXBhc3M=
+  POSTGRES_PASSWORD: cG9zdGdyZXM=
+  REPLICATION_USER: cmVwbA==
+  REPLICATION_PASSWORD: cmVwLXBhc3M=
 
 ---
-# Headless service para descubrimiento de pods (usado por StatefulSets)
+# ConfigMap with initialization and replica bootstrap scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-scripts
+data:
+  # Script run on master during first init (placed in /docker-entrypoint-initdb.d)
+  create-replication-user.sh: |
+    #!/bin/bash
+    set -e
+    echo "Creating replication user if not exists..."
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
+    DO
+    $$
+    BEGIN
+      IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN
+        CREATE ROLE "$REPLICATION_USER" REPLICATION LOGIN ENCRYPTED PASSWORD '$REPLICATION_PASSWORD';
+      END IF;
+    END
+    $$;
+    EOSQL
+    # Allow replication connections from cluster namespace (adjust CIDR if needed)
+    echo "host replication $REPLICATION_USER 0.0.0.0/0 md5" >> "$PGDATA/pg_hba.conf"
+
+  # Replica bootstrap script used by initContainer on replicas
+  replica-bootstrap.sh: |
+    #!/bin/bash
+    set -e
+    echo "Replica bootstrap: checking data dir..."
+    # PGDATA is expected to be set (default: /var/lib/postgresql/data)
+    if [ -f "$PGDATA/PG_VERSION" ]; then
+      echo "Data directory already initialized, skipping base backup"
+      exit 0
+    fi
+    export PGPASSWORD="$REPLICATION_PASSWORD"
+    echo "Waiting for primary $PRIMARY_HOST to be ready..."
+    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$REPLICATION_USER"; do
+      sleep 1
+    done
+    echo "Running pg_basebackup from $PRIMARY_HOST..."
+    pg_basebackup -h "$PRIMARY_HOST" -D "$PGDATA" -U "$REPLICATION_USER" -v -P --wal-method=stream
+    # Mark as standby (Postgres 12+)
+    touch "$PGDATA/standby.signal"
+    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$REPLICATION_PASSWORD application_name=$(hostname)'" >> "$PGDATA/postgresql.auto.conf"
+    chown -R postgres:postgres "$PGDATA"
+
+---
+# Headless service for StatefulSets discovery
 apiVersion: v1
 kind: Service
 metadata:
@@ -30,7 +82,7 @@ spec:
       name: postgres
 
 ---
-# Servicio para acceder al master (nodo de escritura)
+# Service to expose the master (writer)
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,7 +100,7 @@ spec:
       name: postgres
 
 ---
-# StatefulSet: Master (escritura)
+# StatefulSet for master (1 replica)
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -70,53 +122,58 @@ spec:
         role: master
     spec:
       containers:
-        - name: postgresql
-          image: bitnami/postgresql:15
+        - name: postgres
+          image: postgres:15
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
               name: postgres
           env:
-            - name: POSTGRESQL_REPLICATION_MODE
-              value: "master"
-            - name: POSTGRESQL_PASSWORD
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_PASSWORD
-            - name: POSTGRESQL_REPLICATION_USER
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: appdb
+            - name: REPLICATION_USER
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_REPLICATION_USER
-            - name: POSTGRESQL_REPLICATION_PASSWORD
+                  key: REPLICATION_USER
+            - name: REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_REPLICATION_PASSWORD
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_DATABASE
-              value: "appdb"
+                  key: REPLICATION_PASSWORD
           volumeMounts:
             - name: data
-              mountPath: /bitnami/postgresql
+              mountPath: /var/lib/postgresql/data
+            - name: scripts
+              mountPath: /docker-entrypoint-initdb.d
           readinessProbe:
             exec:
               command:
                 - "bash"
                 - "-lc"
-                - "pg_isready -U $POSTGRESQL_USERNAME"
-            initialDelaySeconds: 15
+                - "pg_isready -U $POSTGRES_USER"
+            initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             exec:
               command:
                 - "bash"
                 - "-lc"
-                - "pg_isready -U $POSTGRESQL_USERNAME"
+                - "pg_isready -U $POSTGRES_USER"
             initialDelaySeconds: 30
             periodSeconds: 20
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-scripts
+            defaultMode: 0775
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -127,7 +184,7 @@ spec:
             storage: 10Gi
 
 ---
-# StatefulSet: Replicas (lectura)
+# StatefulSet for replicas (2 replicas)
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -148,56 +205,67 @@ spec:
         app: postgres
         role: replica
     spec:
+      initContainers:
+        - name: replica-bootstrap
+          image: postgres:15
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/bash"
+            - "-c"
+            - "/scripts/replica-bootstrap.sh"
+          env:
+            - name: PRIMARY_HOST
+              value: postgres-primary
+            - name: REPLICATION_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: REPLICATION_USER
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: REPLICATION_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: scripts
+              mountPath: /scripts
       containers:
-        - name: postgresql
-          image: bitnami/postgresql:15
+        - name: postgres
+          image: postgres:15
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
               name: postgres
           env:
-            - name: POSTGRESQL_REPLICATION_MODE
-              value: "replica"
-            - name: POSTGRESQL_PRIMARY_HOST
-              value: "postgres-primary"
-            - name: POSTGRESQL_REPLICATION_USER
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_REPLICATION_USER
-            - name: POSTGRESQL_REPLICATION_PASSWORD
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: appdb
+            - name: REPLICATION_USER
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_REPLICATION_PASSWORD
-            - name: POSTGRESQL_PASSWORD
+                  key: REPLICATION_USER
+            - name: REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
-                  key: POSTGRESQL_PASSWORD
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_DATABASE
-              value: "appdb"
+                  key: REPLICATION_PASSWORD
           volumeMounts:
             - name: data
-              mountPath: /bitnami/postgresql
-          readinessProbe:
-            exec:
-              command:
-                - "bash"
-                - "-lc"
-                - "pg_isready -U $POSTGRESQL_USERNAME"
-            initialDelaySeconds: 20
-            periodSeconds: 10
-          livenessProbe:
-            exec:
-              command:
-                - "bash"
-                - "-lc"
-                - "pg_isready -U $POSTGRESQL_USERNAME"
-            initialDelaySeconds: 40
-            periodSeconds: 20
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-scripts
+            defaultMode: 0775
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -206,9 +274,9 @@ spec:
         resources:
           requests:
             storage: 10Gi
-# Nota: esta configuración usa la imagen oficial de Bitnami que facilita el arranque
-# en modo master/replica con variables de entorno. Ajusta almacenamiento y secretos
-# a tu entorno (StorageClass, passwords, recursos). Para producción, asegura las
-# contraseñas y considera usar un operador (p.ej. Zalando Patroni, CrunchyData o
-# un chart Helm) para gestión de failover avanzada.
+
+# Notas:
+# - Reemplaza los valores del Secret por contraseñas seguras (usa kubectl create secret or echo -n | base64).
+# - Este manifiesto realiza una replicación básica usando pg_basebackup y standby.signal.
+# - No incluye gestor de failover automático. Para failover y promociones automáticas usa un operador (Patroni/Crunchy/Helm).
 
